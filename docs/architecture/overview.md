@@ -42,7 +42,7 @@ Representative implementation files in this checkout:
 
 ## Delivery contract and limits
 
-Events are encoded as their Core JSON envelope and mapped to `<topic_prefix>.<event_name>`. The
+Events use CloudEvents 1.0 structured JSON and are mapped to `<topic_prefix>.<event_name>`. The
 maximum encoded message size is configurable and bounded. Consumers disable automatic offset commits
 and commit only after the handler completes, providing at-least-once processing. A failed handler is
 retried a configured finite number of times with bounded backoff. Once retries are exhausted, that
@@ -50,10 +50,16 @@ consumer stops without committing the failed offset; restarting/rebalancing the 
 again. Inspect `failed_subscriptions` and application logs for stopped consumers.
 
 This is not exactly-once processing: handlers must be idempotent when duplicate delivery matters.
-The package does not provide a dead-letter topic, schema registry, outbox, cross-service transaction,
-automatic topic creation, or broker provisioning. Topic ACLs, retention, replication, TLS, monitoring,
-and deployment reliability are operator responsibilities. No live Kafka broker test is claimed by
-the fake-client unit suite.
+Dead-letter delivery is opt-in through `KafkaConfig.dead_letter_topic`. The adapter publishes the
+unchanged payload and safe source metadata, waits for the broker acknowledgement, then commits the
+source offset. A failed publish leaves the source uncommitted. A commit failure after a successful
+DLQ publish can produce a duplicate; the key identifies the source topic, partition, and offset but
+does not provide broker-side deduplication or atomicity.
+
+The operator provisions DLQ topics, partitions, retention, ACLs, and monitoring. DLQ payloads may
+contain sensitive original data and need restricted readers. Topic creation, schema registry,
+outbox, and cross-service transactions remain outside this adapter. No live Kafka broker test is
+claimed by the fake-client suite.
 
 ## Boundary rules
 

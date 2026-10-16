@@ -27,6 +27,7 @@ from uuid import UUID, uuid4
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.structs import ConsumerRecord, TopicPartition
 from orbit.events import Event, EventHandler, EventTransport
+from orbit_events import decode_event, encode_cloudevent
 
 from orbit_events_kafka.config import KafkaConfig
 
@@ -50,7 +51,14 @@ class _Producer(Protocol):
         """Start the Kafka producer and establish its broker connections."""
         ...
 
-    async def send_and_wait(self, topic: str, value: bytes) -> object:
+    async def send_and_wait(
+        self,
+        topic: str,
+        value: bytes,
+        *,
+        key: bytes | None = None,
+        headers: list[tuple[str, bytes]] | None = None,
+    ) -> object:
         """Send a serialized event and wait for the broker acknowledgement."""
         ...
 
@@ -149,15 +157,17 @@ class KafkaEventTransport(EventTransport):
         if self._closed:
             raise KafkaTransportError("publish")
         topic = self.topic_for(event.name)
-        payload = event.model_dump_json().encode("utf-8")
-        if len(payload) > self.config.max_message_bytes:
-            raise ValueError("Encoded event exceeds KafkaConfig.max_message_bytes.")
+        payload = encode_cloudevent(event, max_bytes=self.config.max_message_bytes)
         producer = await self._ensure_producer()
         async with self._publish_lock:
             if self._closed:
                 raise KafkaTransportError("publish")
             try:
-                await producer.send_and_wait(topic, payload)
+                await producer.send_and_wait(
+                    topic,
+                    payload,
+                    headers=[("content-type", b"application/cloudevents+json")],
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -181,6 +191,10 @@ class KafkaEventTransport(EventTransport):
                     raise KafkaTransportError("connect") from None
                 self._producer = producer
             return self._producer
+
+    async def check_connection(self) -> None:
+        """Establish the configured producer connection without publishing an event."""
+        await self._ensure_producer()
 
     async def subscribe(self, event_name: str, handler: EventHandler) -> UUID:
         """Start one manually committed consumer for an event name and return its token."""
@@ -223,7 +237,7 @@ class KafkaEventTransport(EventTransport):
         try:
             async for message in consumer:
                 try:
-                    event = Event[Any].model_validate_json(message.value)
+                    event = decode_event(message.value, max_bytes=self.config.max_message_bytes)
                     if event.name != event_name:
                         raise ValueError("Event envelope name does not match its Kafka topic.")
                 except Exception:
@@ -231,6 +245,8 @@ class KafkaEventTransport(EventTransport):
                     _LOG.error(
                         "Kafka consumer stopped after invalid event for topic %s", message.topic
                     )
+                    if self.config.dead_letter_topic is not None:
+                        await self._dead_letter(consumer, message, event_name, "InvalidEventError")
                     return
 
                 delivered = False
@@ -248,6 +264,10 @@ class KafkaEventTransport(EventTransport):
                             _LOG.error(
                                 "Kafka handler stopped after retries (%s)", type(exc).__name__
                             )
+                            if self.config.dead_letter_topic is not None:
+                                await self._dead_letter(
+                                    consumer, message, event_name, type(exc).__name__
+                                )
                             return
                         consumer.seek(message.topic_partition, message.offset)
                         await asyncio.sleep(self.config.retry_backoff_seconds)
@@ -258,6 +278,41 @@ class KafkaEventTransport(EventTransport):
         except Exception as exc:
             self._failed.add(token)
             _LOG.error("Kafka consumer stopped after transport error (%s)", type(exc).__name__)
+
+    async def _dead_letter(
+        self, consumer: _Consumer, message: ConsumerRecord, event_name: str, reason: str
+    ) -> None:
+        """Persist original poison bytes before committing the source offset."""
+        topic = self.config.dead_letter_topic
+        if topic is None:
+            return
+        raw_value = message.value
+        headers = [
+            ("orbit-dead-letter-source-topic", message.topic.encode("utf-8")),
+            ("orbit-dead-letter-source-partition", str(message.partition).encode("ascii")),
+            ("orbit-dead-letter-source-offset", str(message.offset).encode("ascii")),
+            ("orbit-dead-letter-event-name", event_name.encode("ascii")),
+            ("orbit-dead-letter-reason", reason[:64].encode("ascii", errors="ignore")),
+            ("orbit-dead-letter-content-type", b"application/octet-stream"),
+            ("orbit-dead-letter-null-value", b"true" if raw_value is None else b"false"),
+        ]
+        producer = await self._ensure_producer()
+        try:
+            async with self._publish_lock:
+                if self._closed:
+                    raise KafkaTransportError("dead-letter")
+                await producer.send_and_wait(
+                    topic,
+                    raw_value or b"",
+                    key=f"{message.topic}:{message.partition}:{message.offset}".encode("ascii"),
+                    headers=headers,
+                )
+                await consumer.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The source offset intentionally remains uncommitted if the DLQ write or commit fails.
+            raise KafkaTransportError("dead-letter") from None
 
     async def unsubscribe(self, token: object) -> None:
         """Cancel and stop one owned consumer, rejecting unknown subscription tokens."""
@@ -282,15 +337,16 @@ class KafkaEventTransport(EventTransport):
                 self._event_tokens.pop(subscription.event_name, None)
 
     async def close(self) -> None:
-        """Stop all consumers and producer; repeated calls are safe."""
+        """Stop all consumers and the producer, retaining failed cleanup for retry.
+
+        The transport becomes unavailable before cleanup begins. Each resource stays owned until
+        its ``stop()`` succeeds, so cancellation or a vendor cleanup error does not make a later
+        ``close()`` silently forget a live client.
+        """
         async with self._close_lock:
             async with self._state_lock:
-                if self._closed:
-                    return
                 self._closed = True
                 subscriptions = tuple(self._subscriptions.items())
-                self._subscriptions.clear()
-                self._event_tokens.clear()
             for _token, subscription in subscriptions:
                 subscription.task.cancel()
             if subscriptions:
@@ -302,16 +358,29 @@ class KafkaEventTransport(EventTransport):
             for _token, subscription in subscriptions:
                 try:
                     await subscription.consumer.stop()
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
                     failures.append(exc)
+                else:
+                    # close_lock serializes unsubscribe/close, and _closed prevents new
+                    # subscriptions, so these ownership maps cannot be repopulated here.
+                    self._subscriptions.pop(_token, None)
+                    self._event_tokens.pop(subscription.event_name, None)
             async with self._publish_lock:
                 async with self._producer_lock:
-                    producer, self._producer = self._producer, None
+                    producer = self._producer
                 if producer is not None:
                     try:
                         await producer.stop()
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as exc:
                         failures.append(exc)
+                    else:
+                        async with self._producer_lock:
+                            if self._producer is producer:
+                                self._producer = None
             if failures:
                 raise KafkaTransportError("close") from None
 

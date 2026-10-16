@@ -51,6 +51,8 @@ class FakeProducer:
         """Capture options passed to the injected client factory."""
         self.options = options
         self.messages: list[tuple[str, bytes]] = []
+        self.keys: list[bytes | None] = []
+        self.sent_headers: list[list[tuple[str, bytes]] | None] = []
         self.started = False
         self.stopped = False
         self.failure: Exception | None = None
@@ -59,11 +61,21 @@ class FakeProducer:
         """Mark the fake producer connected."""
         self.started = True
 
-    async def send_and_wait(self, topic: str, value: bytes) -> object:
+    async def send_and_wait(
+        self,
+        topic: str,
+        value: bytes,
+        *,
+        key: bytes | None = None,
+        headers: list[tuple[str, bytes]] | None = None,
+    ) -> object:
         """Capture bytes or simulate a vendor-side send failure."""
         if self.failure is not None:
             raise self.failure
         self.messages.append((topic, value))
+        self.keys.append(key)
+        self.sent_headers.append(headers)
+        self.headers = headers
         return object()
 
     async def stop(self) -> None:
@@ -153,7 +165,8 @@ async def test_publish_is_lazy_json_encoded_bounded_and_sanitizes_driver_errors(
     assert producers[0].started
     assert producers[0].messages[0][0] == "orbit.events.orders.created"
     assert len(producers[0].messages) == 8
-    assert b'"name":"orders.created"' in producers[0].messages[0][1]
+    assert b'"specversion":"1.0"' in producers[0].messages[0][1]
+    assert producers[0].headers == [("content-type", b"application/cloudevents+json")]
     await transport.close()
     assert producers[0].stopped
     with pytest.raises(KafkaTransportError):
@@ -162,7 +175,7 @@ async def test_publish_is_lazy_json_encoded_bounded_and_sanitizes_driver_errors(
     oversized = KafkaEventTransport(
         make_config(max_message_bytes=20), producer_factory=create_producer
     )
-    with pytest.raises(ValueError, match="max_message_bytes"):
+    with pytest.raises(ValueError, match="byte limit"):
         await oversized.publish(event)
     assert len(producers) == 1
 
@@ -206,7 +219,9 @@ async def test_subscriber_commits_only_after_handler_and_closes_with_transport()
     assert consumer.started
     consumer.records.put_nowait(
         SimpleNamespace(
-            value=Event(name="orders.created", payload={"order_id": "o-1"}).model_dump_json(),
+            value=Event(name="orders.created", payload={"order_id": "o-1"})
+            .model_dump_json()
+            .encode(),
             topic=consumer.topic,
             topic_partition=object(),
             offset=0,
@@ -283,6 +298,100 @@ async def test_failed_unsubscribe_stop_remains_owned_for_transport_close_retry()
     assert consumers[0].stopped
 
 
+@pytest.mark.asyncio
+async def test_close_retries_consumer_and_producer_resources_that_failed_to_stop() -> None:
+    """Partial shutdown retains only clients whose vendor stop operation failed."""
+    consumers: list[FakeConsumer] = []
+    producers: list[FakeProducer] = []
+
+    class FailOnceConsumer(FakeConsumer):
+        def __init__(self, topic: str, **options: object) -> None:
+            super().__init__(topic, **options)
+            self.stop_attempts = 0
+
+        async def stop(self) -> None:
+            self.stop_attempts += 1
+            if self.stop_attempts == 1:
+                raise RuntimeError("private consumer state")
+            await super().stop()
+
+    class FailOnceProducer(FakeProducer):
+        def __init__(self, **options: object) -> None:
+            super().__init__(**options)
+            self.stop_attempts = 0
+
+        async def stop(self) -> None:
+            self.stop_attempts += 1
+            if self.stop_attempts == 1:
+                raise RuntimeError("private producer state")
+            await super().stop()
+
+    def create_consumer(topic: str, **options: object) -> FailOnceConsumer:
+        consumer = FailOnceConsumer(topic, **options)
+        consumers.append(consumer)
+        return consumer
+
+    def create_producer(**options: object) -> FailOnceProducer:
+        producer = FailOnceProducer(**options)
+        producers.append(producer)
+        return producer
+
+    transport = KafkaEventTransport(
+        make_config(),
+        consumer_factory=create_consumer,
+        producer_factory=create_producer,
+    )
+    await transport.subscribe("orders.created", _ignore_event)
+    await transport.publish(Event(name="orders.created", payload={"order_id": "o-1"}))
+
+    with pytest.raises(KafkaTransportError, match="close"):
+        await transport.close()
+
+    assert consumers[0].stop_attempts == 1
+    assert producers[0].stop_attempts == 1
+    await transport.close()
+    assert consumers[0].stop_attempts == 2
+    assert consumers[0].stopped
+    assert producers[0].stop_attempts == 2
+    assert producers[0].stopped
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_keeps_consumer_for_a_later_cleanup_attempt() -> None:
+    """Caller cancellation does not erase ownership before consumer stop completes."""
+    stopping = asyncio.Event()
+    consumers: list[FakeConsumer] = []
+
+    class CancelFirstStopConsumer(FakeConsumer):
+        def __init__(self, topic: str, **options: object) -> None:
+            super().__init__(topic, **options)
+            self.stop_attempts = 0
+
+        async def stop(self) -> None:
+            self.stop_attempts += 1
+            if self.stop_attempts == 1:
+                stopping.set()
+                await asyncio.Event().wait()
+            await super().stop()
+
+    def create_consumer(topic: str, **options: object) -> CancelFirstStopConsumer:
+        consumer = CancelFirstStopConsumer(topic, **options)
+        consumers.append(consumer)
+        return consumer
+
+    transport = KafkaEventTransport(make_config(), consumer_factory=create_consumer)
+    await transport.subscribe("orders.created", _ignore_event)
+    close_task = asyncio.create_task(transport.close())
+    await stopping.wait()
+    close_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    await transport.close()
+    assert consumers[0].stop_attempts == 2
+    assert consumers[0].stopped
+
+
 async def _ignore_event(event: Event[Any]) -> None:
     """No-op handler for lifecycle tests that do not publish records."""
     del event
@@ -320,7 +429,7 @@ async def test_exhausted_handler_retries_are_visible_and_not_committed() -> None
     consumer = consumers[0]
     consumer.records.put_nowait(
         SimpleNamespace(
-            value=Event(name="orders.failed", payload={}).model_dump_json(),
+            value=Event(name="orders.failed", payload={}).model_dump_json().encode(),
             topic=consumer.topic,
             topic_partition=object(),
             offset=3,
@@ -334,6 +443,145 @@ async def test_exhausted_handler_retries_are_visible_and_not_committed() -> None
     assert "sensitive handler failure" not in repr(transport.failed_subscriptions)
     await transport.close()
     assert consumer.stopped
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_waits_for_broker_ack_before_committing_source_offset() -> None:
+    """A configured DLQ receives original bytes and safe source metadata before commit."""
+    consumers: list[FakeConsumer] = []
+    producers: list[FakeProducer] = []
+
+    def create_consumer(topic: str, **options: object) -> FakeConsumer:
+        consumer = FakeConsumer(topic, **options)
+        consumers.append(consumer)
+        return consumer
+
+    def create_producer(**options: object) -> FakeProducer:
+        producer = FakeProducer(**options)
+        producers.append(producer)
+        return producer
+
+    transport = KafkaEventTransport(
+        make_config(max_handler_retries=0, dead_letter_topic="orbit.dead-letter"),
+        consumer_factory=create_consumer,
+        producer_factory=create_producer,
+    )
+
+    async def handler(_event: Event[Any]) -> None:
+        raise RuntimeError("private application detail")
+
+    token = await transport.subscribe("orders.failed", handler)
+    consumer = consumers[0]
+    raw = Event(name="orders.failed", payload={"sensitive": "body"}).model_dump_json().encode()
+    consumer.records.put_nowait(
+        SimpleNamespace(
+            value=raw,
+            topic=consumer.topic,
+            partition=2,
+            topic_partition=object(),
+            offset=13,
+        )
+    )
+    async with asyncio.timeout(1):
+        while token not in transport.failed_subscriptions:
+            await asyncio.sleep(0)
+
+    assert consumer.commits == 1
+    assert producers[0].messages == [("orbit.dead-letter", raw)]
+    assert producers[0].keys == [b"orbit.events.orders.failed:2:13"]
+    header_map = dict(producers[0].sent_headers[0] or [])
+    assert header_map["orbit-dead-letter-reason"] == b"RuntimeError"
+    assert header_map["orbit-dead-letter-source-offset"] == b"13"
+    assert b"private application detail" not in repr(header_map).encode()
+    await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_publish_failure_does_not_commit_source_offset() -> None:
+    """Broker failure leaves the poison record uncommitted for a later delivery."""
+    consumers: list[FakeConsumer] = []
+    producers: list[FakeProducer] = []
+
+    def create_consumer(topic: str, **options: object) -> FakeConsumer:
+        consumer = FakeConsumer(topic, **options)
+        consumers.append(consumer)
+        return consumer
+
+    def create_producer(**options: object) -> FakeProducer:
+        producer = FakeProducer(**options)
+        producer.failure = RuntimeError("private broker detail")
+        producers.append(producer)
+        return producer
+
+    transport = KafkaEventTransport(
+        make_config(max_handler_retries=0, dead_letter_topic="orbit.dead-letter"),
+        consumer_factory=create_consumer,
+        producer_factory=create_producer,
+    )
+
+    async def handler(_event: Event[Any]) -> None:
+        raise RuntimeError("handler failed")
+
+    token = await transport.subscribe("orders.failed", handler)
+    consumer = consumers[0]
+    consumer.records.put_nowait(
+        SimpleNamespace(
+            value=Event(name="orders.failed", payload={}).model_dump_json().encode(),
+            topic=consumer.topic,
+            partition=0,
+            topic_partition=object(),
+            offset=1,
+        )
+    )
+    async with asyncio.timeout(1):
+        while token not in transport.failed_subscriptions:
+            await asyncio.sleep(0)
+    assert consumer.commits == 0
+    await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_event_bytes_are_retained_in_dead_letter_topic() -> None:
+    """Malformed bytes bypass handlers and reach the configured DLQ before offset commit."""
+    consumers: list[FakeConsumer] = []
+    producers: list[FakeProducer] = []
+
+    def create_consumer(topic: str, **options: object) -> FakeConsumer:
+        consumer = FakeConsumer(topic, **options)
+        consumers.append(consumer)
+        return consumer
+
+    def create_producer(**options: object) -> FakeProducer:
+        producer = FakeProducer(**options)
+        producers.append(producer)
+        return producer
+
+    transport = KafkaEventTransport(
+        make_config(dead_letter_topic="orbit.dead-letter"),
+        consumer_factory=create_consumer,
+        producer_factory=create_producer,
+    )
+    token = await transport.subscribe("orders.invalid", _ignore_event)
+    consumer = consumers[0]
+    raw = b'{"specversion":"broken","private":"data"}'
+    consumer.records.put_nowait(
+        SimpleNamespace(
+            value=raw,
+            topic=consumer.topic,
+            partition=0,
+            topic_partition=object(),
+            offset=9,
+        )
+    )
+    async with asyncio.timeout(1):
+        while token not in transport.failed_subscriptions:
+            await asyncio.sleep(0)
+
+    assert consumer.commits == 1
+    assert producers[0].messages == [("orbit.dead-letter", raw)]
+    headers = dict(producers[0].sent_headers[0] or [])
+    assert headers["orbit-dead-letter-reason"] == b"InvalidEventError"
+    await transport.close()
 
 
 @pytest.mark.asyncio
@@ -354,3 +602,24 @@ async def test_core_plugin_registers_and_owns_transport_lifecycle() -> None:
     await app.stop()
     assert transport.closed
     assert not producers
+
+
+@pytest.mark.asyncio
+async def test_core_plugin_connection_action_establishes_and_closes_producer() -> None:
+    """The CLI connectivity action sends no records and leaves cleanup to the plugin."""
+    producers: list[FakeProducer] = []
+
+    def create_producer(**options: object) -> FakeProducer:
+        producer = FakeProducer(**options)
+        producers.append(producer)
+        return producer
+
+    transport = KafkaEventTransport(make_config(), producer_factory=create_producer)
+    plugin = KafkaTransportPlugin(transport)
+
+    result = await plugin.control_actions[0].handler({})
+
+    assert result is not None and result.summary == "Kafka producer connection is established."
+    assert len(producers) == 1 and producers[0].started and not producers[0].messages
+    await plugin.deactivate()
+    assert producers[0].stopped

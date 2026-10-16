@@ -15,9 +15,12 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+
+_TOPIC = re.compile(r"[A-Za-z0-9._-]{1,249}\Z")
 
 
 class KafkaConfig(BaseModel):
@@ -27,6 +30,7 @@ class KafkaConfig(BaseModel):
 
     bootstrap_servers: tuple[str, ...] = Field(min_length=1, max_length=64)
     topic_prefix: str = "orbit.events"
+    dead_letter_topic: str | None = None
     group_id: str = Field(min_length=1, max_length=100)
     security_protocol: Literal["PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL"] = "PLAINTEXT"
     sasl_mechanism: Literal["PLAIN"] | None = None
@@ -62,6 +66,29 @@ class KafkaConfig(BaseModel):
                 "Kafka topic prefix may contain only ASCII letters, digits, '.', '_' and '-'."
             )
         return value
+
+    @field_validator("dead_letter_topic")
+    @classmethod
+    def validate_dead_letter_topic(cls, value: str | None) -> str | None:
+        """Validate an explicitly configured Kafka DLQ topic name."""
+        if value is None:
+            return None
+        if (
+            _TOPIC.fullmatch(value) is None
+            or value.startswith((".", "_", "-"))
+            or value in {".", ".."}
+        ):
+            raise ValueError("Kafka dead-letter topic must use 1–249 portable topic characters.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_dead_letter_topic_is_distinct(self) -> KafkaConfig:
+        """Reject a DLQ topic that collides with this package's generated event topics."""
+        if self.dead_letter_topic is not None and self.dead_letter_topic.startswith(
+            f"{self.topic_prefix}."
+        ):
+            raise ValueError("Kafka dead-letter topic must not overlap generated event topics.")
+        return self
 
     @model_validator(mode="after")
     def validate_sasl(self) -> KafkaConfig:

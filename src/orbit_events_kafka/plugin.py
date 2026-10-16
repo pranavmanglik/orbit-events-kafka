@@ -13,8 +13,10 @@
 # limitations under the License.
 """Optional Core plugin that registers and owns one Kafka event transport."""
 
+from collections.abc import Mapping
+
 from orbit import Application
-from orbit.plugins import Plugin, PluginMetadata
+from orbit.plugins import ControlAction, ControlResult, Plugin, PluginMetadata
 
 from orbit_events_kafka.transport import KafkaEventTransport
 
@@ -35,6 +37,14 @@ class KafkaTransportPlugin(Plugin):
         if not isinstance(transport, KafkaEventTransport):
             raise TypeError("KafkaTransportPlugin requires a KafkaEventTransport instance.")
         self.transport = transport
+        self.control_actions = (
+            ControlAction(
+                id="check-connection",
+                title="Check Kafka connection",
+                description="Establish the producer connection without publishing an event.",
+                handler=self._check_connection,
+            ),
+        )
 
     def setup(self, application: Application) -> None:
         """Expose the transport under its stable optional-package dependency key."""
@@ -45,6 +55,11 @@ class KafkaTransportPlugin(Plugin):
     async def deactivate(self) -> None:
         """Stop consumers and producer on normal shutdown or startup rollback."""
         await self.transport.close()
+
+    async def _check_connection(self, _: Mapping[str, object]) -> ControlResult:
+        """Establish the bounded producer connection and retain it for normal plugin cleanup."""
+        await self.transport.check_connection()
+        return ControlResult("Kafka producer connection is established.")
 
 
 __all__ = ["KAFKA_EVENT_TRANSPORT_KEY", "KafkaTransportPlugin"]

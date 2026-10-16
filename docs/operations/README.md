@@ -50,9 +50,16 @@ Register at most one handler for a given event name on a transport instance. Con
 `unsubscribe()` and transport shutdown are serialized so shutdown waits for a consumer stop already
 in progress.
 
+Transport shutdown rejects new work, cancels and joins consumer tasks, stops each consumer, then
+flushes and stops the producer. Successfully stopped clients are released independently. If a client
+stop fails or the caller is cancelled, the remaining client references stay owned; a later
+`close()` retries cleanup. Configure the host's graceful-shutdown deadline to cover in-flight
+handlers and the broker client's own request/close timeouts.
+
 ## Delivery contract and limits
 
-Events are encoded as their Core JSON envelope and mapped to `<topic_prefix>.<event_name>`. The
+Events use CloudEvents 1.0 structured JSON, advertise `application/cloudevents+json`, and are mapped
+to `<topic_prefix>.<event_name>`. The
 maximum encoded message size is configurable and bounded. Consumers disable automatic offset commits
 and commit only after the handler completes, providing at-least-once processing. A failed handler is
 retried a configured finite number of times with bounded backoff. Once retries are exhausted, that
@@ -60,10 +67,15 @@ consumer stops without committing the failed offset; restarting/rebalancing the 
 again. Inspect `failed_subscriptions` and application logs for stopped consumers.
 
 This is not exactly-once processing: handlers must be idempotent when duplicate delivery matters.
-The package does not provide a dead-letter topic, schema registry, outbox, cross-service transaction,
-automatic topic creation, or broker provisioning. Topic ACLs, retention, replication, TLS, monitoring,
-and deployment reliability are operator responsibilities. No live Kafka broker test is claimed by
-the fake-client unit suite.
+To enable dead-lettering, provision a separate topic and configure
+`KafkaConfig(dead_letter_topic="orbit.events.dead-letter")`. The producer writes the raw failed
+record and bounded metadata then awaits broker acknowledgement before source offset commit. A
+successful DLQ write followed by failed offset commit can yield duplicates; use the key's source
+topic/partition/offset to recognize them. The feature does not provide an atomic transaction.
+
+Restrict DLQ read access because original payloads can contain sensitive data. Configure retention,
+replication, monitoring, and topic ACLs for the environment. This adapter does not create topics.
+No live Kafka broker test is claimed by the fake-client unit suite.
 
 ## Production validation
 
